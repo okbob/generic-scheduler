@@ -3,6 +3,9 @@
  * IDENTIFICATION
  *		dbworker.c
  *
+ * author: Pavel Stehule, 2015, Czech Republic,
+ * licenced under BSD licence
+ *
  *-------------------------------------------------------------------------
  */
 #include "scheduler.h"

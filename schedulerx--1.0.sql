@@ -1,8 +1,12 @@
-/* src/test/modules/dummy_seclabel/dummy_seclabel--1.0.sql */
-
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION scheduler" to load this file. \quit
 
+/*
+ * Due necessity to push data from table across process via shared memory
+ * where pointers are disallowed, all fields are marked as NOT NULL.
+ * It strongly reduce code neccessary to transport data from reader to
+ * central scheduler process.
+ */
 CREATE TABLE job_schedule(
   id serial PRIMARY KEY,
   suspended boolean NOT NULL DEFAULT false,          /* true when job is not active - the cmd is not evaluated */
@@ -21,59 +25,123 @@ CREATE TABLE job_schedule(
   job_start_delay interval NOT NULL DEFAULT '0sec'   /* delay between receiving NOTIFY event and job start, all notifications are merged */
 );
 
+-- nonempty job_name should be unique
 CREATE UNIQUE INDEX ON job_schedule((CASE WHEN job_name = '' THEN NULL ELSE job_name END));
 
 CREATE FUNCTION scheduler_change_configuration(d job_schedule, op "char")
 RETURNS void AS 'MODULE_PATHNAME','jbsch_signal_configuration_change' LANGUAGE C;
 
-CREATE OR REPLACE FUNCTION enable_scheduler()
-RETURNS void AS $$
+CREATE OR REPLACE FUNCTION is_power_user()
+RETURNS boolean AS $$
 BEGIN
-  EXECUTE format(e'SECURITY LABEL FOR jobscheduler ON DATABASE %s IS \'active\'', current_database());
+  IF EXISTS(SELECT *
+               FROM pg_roles r JOIN pg_database d ON r.oid = d.datdba
+              WHERE d.rolname = CURRENT_USER)
+  THEN
+    RETURN true; -- database owner
+  ELSIF EXISTS(SELECT *
+                  FROM pg_roles
+                 WHERE rolname = CURRENT_USER AND rolsuper)
+  THEN
+    RETURN true; -- superuser
+  END IF;
+  RETURN false;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION disable_scheduler()
-RETURNS void AS $$
-BEGIN
-  EXECUTE format(e'SECURITY LABEL FOR jobscheduler ON DATABASE %s IS \'nonactive\'', current_database());
-END;
-$$ LANGUAGE plpgsql;
 
-
-CREATE OR REPLACE FUNCTION job_schedule_constraints_trigger_func()
+CREATE OR REPLACE FUNCTION job_schedule_constraints_insert_trigger_func()
 RETURNS TRIGGER AS $$
 BEGIN
-  /*
-   * job_user must be known user, same as current user, or any when current user is database owner
-   * or super user.
-   */
-   IF NEW.job_user <> CURRENT_USER THEN
-     IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = NEW.job_user) THEN
-       RAISE EXCEPTION 'Role % doesn''t exists', NEW.job_user;
-       IF NOT EXISTS (SELECT * FROM pg_roles WHERE rolname = CURRENT_USER AND rolsuper)
-          AND NOT EXISTS(SELECT * FROM pg_roles r JOIN pg_database d ON r.oid = d.datdba AND d.rolname = CURRENT_USER)
-       THEN
-         RAISE EXCEPTION 'Role % doesn''t rights to set job on current database', NEW.job_user;
-       END IF;
-     END IF;
-   END IF;
+  IF NEW.job_user <> CURRENT_USER THEN
+    IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = NEW.job_user) THEN
+      RAISE EXCEPTION 'Role % doesn''t exists', NEW.job_user;
+    END IF;
 
-  PERFORM scheduler_change_configuration(NEW, (CASE WHEN TG_OP = 'INSERT' THEN 'i' ELSE 'u' END)::"char");
+    /* must be power user */
+    IF NOT is_power_user() THEN
+      RAISE EXCEPTION 'Role % doesn''t rights to create job for other users on current database', NEW.job_user;
+    END IF;
+  END IF;
+     
+  PERFORM scheduler_change_configuration(NEW, 'i');
 
   RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER job_schedule_constraints_trigger AFTER INSERT OR UPDATE ON job_schedule
-  FOR EACH ROW EXECUTE PROCEDURE job_schedule_constraints_trigger_func();
+CREATE TRIGGER job_schedule_constraints_insert_trigger AFTER INSERT ON job_schedule
+  FOR EACH ROW EXECUTE PROCEDURE job_schedule_constraints_insert_trigger_func();
 
-DO $$
+
+CREATE OR REPLACE FUNCTION job_schedule_constraints_delete_trigger_func()
+RETURNS TRIGGER AS $$
 BEGIN
-  PERFORM enable_scheduler();
-END;
-$$;
+  IF OLD.job_user <> CURRENT_USER AND NOT is_power_user() THEN
+    RAISE EXCEPTION 'Role % doesn''t rights to drop job for other users on current database', OLD.job_user;
+  END IF;
+     
+  PERFORM scheduler_change_configuration(OLD, 'd');
 
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER job_schedule_constraints_delete_trigger AFTER DELETE ON job_schedule
+  FOR EACH ROW EXECUTE PROCEDURE job_schedule_constraints_delete_trigger_func();
+
+
+CREATE OR REPLACE FUNCTION job_schedule_constraints_update_trigger_func()
+RETURNS TRIGGER AS $$
+DECLARE _is_power_user boolean;
+BEGIN
+  -- are necessary some checking?
+  IF NEW.job_user <> CURRENT_USER OR NEW.job_user <> OLD.job_user THEN
+    _is_power_user := is_power_user();
+
+    IF NEW.job_user <> CURRENT_USER THEN
+      IF NOT EXISTS(SELECT * FROM pg_roles WHERE rolname = NEW.job_user) THEN
+        RAISE EXCEPTION 'Role % doesn''t exists', NEW.job_user;
+      END IF;
+
+      /* must be power user */
+      IF NOT _is_power_user() THEN
+        RAISE EXCEPTION 'Role % doesn''t rights to create job for other users on current database', NEW.job_user;
+      END IF;
+    END IF;
+
+    IF OLD.job_user <> CURRENT_USER AND NOT _is_power_user() THEN
+      RAISE EXCEPTION 'Role % doesn''t rights to update job for other users on current database', OLD.job_user;
+    END IF;
+  END IF;
+
+  PERFORM scheduler_change_configuration(OLD, 'd');
+  PERFORM scheduler_change_configuration(NEW, 'i');
+
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER job_schedule_constraints_update_trigger AFTER UPDATE ON job_schedule
+  FOR EACH ROW EXECUTE PROCEDURE job_schedule_constraints_update_trigger_func();
+
+/*
+ * Disallow truncate
+ */
+CREATE OR REPLACE FUNCTION job_schedule_disallow_truncate_function()
+RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'TRUNCATE statement is not allowed';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER job_schedule_constraints_truncate_trigger BEFORE TRUNCATE ON job_schedule
+  FOR EACH STATEMENT EXECUTE PROCEDURE job_schedule_disallow_truncate_function();
+
+/*
+ * Aux functions for little bit more user friendly job registration
+ *
+ */
 CREATE OR REPLACE FUNCTION register_job_at(job_start timestamp,
                                            job_cmd text, job_user name = current_user, job_name name = '',
                                            max_workers int = 10, run_workers int = 1,
@@ -129,3 +197,34 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+/*
+ * Enable scheduled jobs per database via security label setting
+ *
+ */
+CREATE OR REPLACE FUNCTION enable_scheduler()
+RETURNS void AS $$
+BEGIN
+  EXECUTE format(e'SECURITY LABEL FOR jobscheduler ON DATABASE %s IS \'active\'', current_database());
+END;
+$$ LANGUAGE plpgsql;
+
+/*
+ * Disable scheduled jobs per database via security label setting
+ *
+ */
+CREATE OR REPLACE FUNCTION disable_scheduler()
+RETURNS void AS $$
+BEGIN
+  EXECUTE format(e'SECURITY LABEL FOR jobscheduler ON DATABASE %s IS \'nonactive\'', current_database());
+END;
+$$ LANGUAGE plpgsql;
+
+/*
+ * Enable scheduler for this database by default.
+ *
+ */
+DO $$
+BEGIN
+  PERFORM enable_scheduler();
+END;
+$$;

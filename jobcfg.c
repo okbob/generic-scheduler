@@ -3,6 +3,9 @@
  * IDENTIFICATION
  *		jobcfg.c
  *
+ * author: Pavel Stehule, 2015, Czech Republic,
+ * licenced under BSD licence
+ *
  *-------------------------------------------------------------------------
  */
 #include "scheduler.h"
@@ -83,12 +86,31 @@ jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTupleHeader rec)
 	return;
 }
 
+/*
+ * send sighup to target pid, anybody can do it.
+ */
+static void
+send_sighup(int pid)
+{
+#ifdef HAVE_SETSID
+	if (kill(-pid, SIGHUP))
+#else
+	if (kill(pid, SIGHUP))
+#endif
+	{
+		ereport(ERROR,
+				(errmsg("could not send SIGHUP to scheduler process %d", pid)));
+	}
+}
+
 static void
 signal_configuration_change_internal(char granularity, char op, HeapTupleHeader rec)
 {
 	LWLockTranche tranche;
 	LWLock lwlock;
 	volatile JBSCH_ConfigurationChangeChannel cfgchange_ch = JBSCH_Shm_ConfigurationChangeChannel;
+	int		i = 0;		/* protection against deadlock */
+	bool			aux_sighup = false;
 
 	Assert(cfgchange_ch != NULL);
 
@@ -104,7 +126,21 @@ signal_configuration_change_internal(char granularity, char op, HeapTupleHeader 
 		{
 			SpinLockRelease(&cfgchange_ch->mutex);
 			CHECK_FOR_INTERRUPTS();
-			pg_usleep(1000L);
+			pg_usleep(50 * 1000L);
+
+			/* After 2 sec, resend SIGHUP, it is safe for reading */
+			if (++i > 40 && !aux_sighup)
+			{
+				aux_sighup = true;
+				send_sighup(cfgchange_ch->scheduler_pid);
+			}
+			
+			/* After 5 sec fail */
+			if (i > 100)
+				ereport(ERROR,
+					(errmsg("could not send data to scheduler process %d",
+									 cfgchange_ch->scheduler_pid),
+					 errdetail("scheduler is not active reader")));
 		}
 		else
 		{
@@ -124,20 +160,7 @@ signal_configuration_change_internal(char granularity, char op, HeapTupleHeader 
 		}
 	}
 
-	/*
-	 * anybody can send signal, so pg_signal_backend cannot be used - it is
-	 * much more restrictive.
-	 */
-#ifdef HAVE_SETSID
-	if (kill(-cfgchange_ch->scheduler_pid, SIGHUP))
-#else
-	if (kill(cfgchange_ch->scheduler_pid, SIGHUP))
-#endif
-	{
-		ereport(WARNING,
-				(errmsg("could not send SIGHUP to scheduler process %d",
-					 cfgchange_ch->scheduler_pid)));
-	}
+	send_sighup(cfgchange_ch->scheduler_pid);
 
 	LWLockRelease(&lwlock);
 }
