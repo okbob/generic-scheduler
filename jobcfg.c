@@ -39,33 +39,15 @@ jbsch_to_timeoffset(Interval *interval)
 	return span;
 }
 
-/*
- * Prepare job from tuple
- */
 void
-jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTupleHeader rec)
+jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTuple tuple, TupleDesc tupdesc)
 {
 	Datum		values[Natts_ScheduledJob];
 	bool		nulls[Natts_ScheduledJob];
-	TupleDesc	rectupdesc;
-	HeapTupleData		rectuple;
-	Oid		rectuptyp;
-	int32		rectuptypmod;
 
-	/* basic magic with tuple unpacking */
-	rectuptyp = HeapTupleHeaderGetTypeId(rec);
-	rectuptypmod = HeapTupleHeaderGetTypMod(rec);
-	rectupdesc = lookup_rowtype_tupdesc(rectuptyp, rectuptypmod);
+	Assert(tupdesc->natts == Natts_ScheduledJob);
 
-	Assert(rectupdesc->natts == Natts_ScheduledJob);
-
-	rectuple.t_len = HeapTupleHeaderGetDatumLength(rec);
-	ItemPointerSetInvalid(&(rectuple.t_self));
-	rectuple.t_tableOid = InvalidOid;
-	rectuple.t_data = rec;
-
-	heap_deform_tuple(&rectuple, rectupdesc, values, nulls);
-	ReleaseTupleDesc(rectupdesc);
+	heap_deform_tuple(tuple, tupdesc, values, nulls);
 
 	/* copy values to output */
 	job->id = DatumGetInt32(values[Anum_ScheduledJob_id -1]);
@@ -82,6 +64,34 @@ jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTupleHeader rec)
 	memcpy(job->job_user, NameStr(*DatumGetName(values[Anum_ScheduledJob_job_user - 1])), NAMEDATALEN);
 	memcpy(job->job_name, NameStr(*DatumGetName(values[Anum_ScheduledJob_job_name - 1])), NAMEDATALEN);
 	memcpy(job->listen_channel, NameStr(*DatumGetName(values[Anum_ScheduledJob_listen_channel - 1])), NAMEDATALEN);
+
+	return;
+}
+
+/*
+ * Prepare job from tuple
+ */
+void
+jbsch_SetScheduledJobRecord(JBSCH_ScheduledJob job, HeapTupleHeader rec)
+{
+	TupleDesc	rectupdesc;
+	HeapTupleData		rectuple;
+	Oid		rectuptyp;
+	int32		rectuptypmod;
+
+	/* basic magic with tuple unpacking */
+	rectuptyp = HeapTupleHeaderGetTypeId(rec);
+	rectuptypmod = HeapTupleHeaderGetTypMod(rec);
+	rectupdesc = lookup_rowtype_tupdesc(rectuptyp, rectuptypmod);
+
+	rectuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+	ItemPointerSetInvalid(&(rectuple.t_self));
+	rectuple.t_tableOid = InvalidOid;
+	rectuple.t_data = rec;
+
+	jbsch_SetScheduledJob(job, &rectuple, rectupdesc);
+
+	ReleaseTupleDesc(rectupdesc);
 
 	return;
 }
@@ -112,7 +122,12 @@ signal_configuration_change_internal(char granularity, char op, HeapTupleHeader 
 	int		i = 0;		/* protection against deadlock */
 	bool			aux_sighup = false;
 
-	Assert(cfgchange_ch != NULL);
+	/* when master process is not active */
+	if (cfgchange_ch == NULL)
+	{
+		elog(WARNING, "the scheduler process is not active");
+		return;
+	}
 
 	LWLockRegisterTranche(cfgchange_ch->lock_tranche_id, &tranche);
 	LWLockInitialize(&lwlock, cfgchange_ch->lock_tranche_id);
@@ -148,7 +163,7 @@ signal_configuration_change_internal(char granularity, char op, HeapTupleHeader 
 			cfgchange_ch->op = op;
 
 			if (granularity == 'j')
-				jbsch_SetScheduledJob(&cfgchange_ch->data, rec);
+				jbsch_SetScheduledJobRecord(&cfgchange_ch->data, rec);
 
 			/* add current database info */
 			strcpy(cfgchange_ch->dbname, get_database_name(MyDatabaseId));

@@ -21,6 +21,16 @@
  *      8. publishing
  */
 
+#define MAX_JOBS				100
+#define MAX_DATABASES				100
+
+static JBSCH_ScheduledJobData jobs_configurations[MAX_JOBS];
+static NameData active_databases[MAX_DATABASES];
+
+static int n_job_configurations = 0;
+static int n_active_databases = 0;
+
+static int n_processed_databases = 0;
 
 /* related to shared memory CCC */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -35,6 +45,8 @@ PG_MODULE_MAGIC;
 
 void _PG_init(void);
 void _PG_fini(void);
+
+static void prepare_config_reading(char *dbname);
 
 static void
 scheduler_sighup(SIGNAL_ARGS)
@@ -91,6 +103,176 @@ scheduler_shmem_startup(void)
 	JBSCH_Shm_ConfigurationChangeChannel = cfgchange_ch;
 
 	LWLockRelease(AddinShmemInitLock);
+}
+
+/*
+ * After start reads table job_schedule and send content to parent. When it is started, then
+ * read table job_schedule and waiting for getcfg command. Later one by one sending configurations
+ * to parent - any configuration is confirmed by back command \\data. Whan all configurations are
+ * on parent, \\nodata is send.
+ */
+static void
+config_worker_handler(Datum main_arg)
+{
+	dsm_segment		*segment;
+	JBSCH_DatabaseWorker		self;
+	JBSCH_ScheduledJob		jobcfg;
+
+	void		*received_data;
+	Size		received_bytes;
+	int	res;
+
+	int	ret;
+	int	processed = 0;
+
+	const char *msg_data = "\\data";
+	const char *msg_nodata = "\\nodata";
+
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "database configuration reader");
+	segment = dsm_attach(DatumGetInt32(main_arg));
+	if (segment == NULL)
+		elog(ERROR, "unable map dynamic memory segment");
+
+	self = jbsch_SetupDatabaseWorker(segment);
+
+	/* Register functions for SIGTERM/SIGHUP management */
+	pqsignal(SIGTERM, scheduler_sigterm);
+	set_latch_on_sigusr1 = true;
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	ret = SPI_execute("SELECT * FROM job_schedule WHERE NOT suspended", true, 0);
+	if (ret != SPI_OK_SELECT)
+	{
+		elog(LOG, "config reader: cannot to run query to read configuration");
+		proc_exit(1);
+	}
+
+	jobcfg = (JBSCH_ScheduledJob) shm_toc_allocate(self->toc, (sizeof(JBSCH_ScheduledJobData)));
+	shm_toc_insert(self->toc, 5, (void *) jobcfg);
+
+	while (!got_sigterm)
+	{
+		/*
+		 * With nowait=false it can fall only when parent is detached - finished without
+		 * explicit QUIT command
+		 */
+		res = shm_mq_receive(self->in_mq_handle, &received_bytes, &received_data, false);
+		if (res == SHM_MQ_DETACHED)
+		{
+			elog(LOG, "config reader: parent died");
+			break;
+		}
+
+		/*
+		 * Should not be done
+		 */
+		if (res != SHM_MQ_SUCCESS)
+		{
+			elog(LOG, "config reader: cannot to get data");
+			break;
+		}
+
+		if (strcmp(received_data, "\\q") == 0)
+		{
+			elog(LOG, "config reader: received QUIT command");
+			break;
+		}
+
+		if (strcmp(received_data, "\\getcfg") == 0)
+		{
+			if (processed < SPI_processed)
+			{
+				jbsch_SetScheduledJob(jobcfg, SPI_tuptable->vals[processed++], SPI_tuptable->tupdesc);
+				shm_mq_send(self->out_mq_handle, strlen(msg_data) + 1, msg_data, false);
+			}
+			else
+			{
+				shm_mq_send(self->out_mq_handle, strlen(msg_nodata) + 1, msg_nodata, false);
+			}
+		}
+	}
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	dsm_detach(segment);
+
+	proc_exit(0);
+}
+
+
+/*
+ * stored received configuration. When received \\nodata, close config worker and try
+ * to move to next database. When there are not any other database, finish.
+ */
+static void
+config_worker_receive_trigger(JBSCH_DatabaseWorker dbworker, void *data, Size bytes, void *received_data)
+{
+	char *msg_getcfg = "\\getcfg";
+	char *cmd = (char *) received_data;
+	JBSCH_ScheduledJob		jobcfg;
+
+	if (strcmp(cmd, "\\data") == 0)
+	{
+		if (n_job_configurations < MAX_JOBS)
+		{
+			jobcfg = (JBSCH_ScheduledJob) shm_toc_lookup(dbworker->toc, 5);
+
+			memcpy(&jobs_configurations[n_job_configurations++], jobcfg, sizeof(JBSCH_ScheduledJobData));
+			shm_mq_send(dbworker->out_mq_handle, strlen(msg_getcfg) + 1, msg_getcfg, true);
+		}
+		else
+		{
+			elog(LOG, "scheduler: cannot to store more job configurations");
+			jbsch_SendQuitDbworker(dbworker);
+		}
+	}
+	else if (strcmp(cmd, "\\nodata") == 0)
+	{
+		jbsch_SendQuitDbworker(dbworker);
+		if (n_processed_databases < n_active_databases)
+			prepare_config_reading(NameStr(active_databases[n_processed_databases++]));
+		else
+			elog(LOG, "scheduler: configuration done (%d configurations).", n_job_configurations);
+	}
+}
+
+/*
+ * Ensure to configuration reading when config worker is ready.
+ */
+static void
+config_worker_event_trigger(JBSCH_DatabaseWorker dbworker, void *data, JBSCH_DatabaseWorkerEvent event)
+{
+	char *msg_getcfg = "\\getcfg";
+
+	if (event == JBSCH_DBW_EVENT_TRIGGER_STARTED)
+		shm_mq_send(dbworker->out_mq_handle, strlen(msg_getcfg) + 1, msg_getcfg, true);
+}
+
+/*
+ * Prepare config reader worker for specified database.
+ */
+static void
+prepare_config_reading(char *dbname)
+{
+	JBSCH_DatabaseWorker reader;
+
+	reader = jbsch_NewDatabaseWorker("config reader", dbname, NULL,
+						 sizeof(JBSCH_ScheduledJob) + 4000, 10, 1024,
+							JBSCH_DBW_MQ_BOTH_DIRECTION,
+									    BGW_NEVER_RESTART,
+									    &config_worker_handler,
+									    0);
+
+	jbsch_DBWorkersPoolPush(reader, config_worker_receive_trigger, config_worker_event_trigger, NULL);
 }
 
 static void
@@ -223,6 +405,7 @@ simple_dbw_receive_trigger(JBSCH_DatabaseWorker dbworker, void *data, Size bytes
 	}
 }
 
+
 static void
 main_worker_handler(Datum main_arg)
 {
@@ -230,6 +413,7 @@ main_worker_handler(Datum main_arg)
 
 	JBSCH_DatabaseWorker		dbworker;
 	JBSCH_DatabaseWorker		dbworker2;
+	ResourceOwner		proResourceOwner;
 	int rc;
 
 	int	t1 = 1000;
@@ -239,7 +423,75 @@ main_worker_handler(Datum main_arg)
 	/* attention - it reset CurrentResourceOwner to NULL */
 	BackgroundWorkerInitializeConnection("postgres", NULL);
 
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "database scheduler");
+	proResourceOwner = ResourceOwnerCreate(NULL, "database scheduler");
+
+	CurrentResourceOwner = proResourceOwner;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	PG_TRY();
+	{
+		int	ret;
+		int	i;
+		bool		isnull;
+
+		ret = SPI_execute("SELECT datname"
+		                  "    FROM pg_shseclabel l"
+		                  "         JOIN pg_database d"
+		                  "         ON d.oid = l.objoid"
+		                  "   WHERE l.classoid = 'pg_database'::regclass"
+		                  "     AND l.provider = 'jobscheduler'"
+		                  "     AND l.label = 'active'", true, 0);
+
+		if (ret != SPI_OK_SELECT)
+		{
+			elog(LOG, "scheduler: cannot to take list of active databases");
+			proc_exit(1);
+		}
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			Name datname;
+
+			if (i >= MAX_DATABASES)
+			{
+				elog(LOG, "scheduler: buffer of active databases is full, stop filling");
+				break;
+			}
+
+			datname = DatumGetName(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+			StrNCpy(NameStr(active_databases[n_active_databases++]), NameStr(*datname), NAMEDATALEN);
+
+			elog(LOG, "scheduler: active database: %s", NameStr(active_databases[n_active_databases - 1]));
+		}
+
+		SPI_finish();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		AbortCurrentTransaction();
+		pgstat_report_activity(STATE_IDLE, NULL);
+		FlushErrorState();
+
+		elog(LOG, "some wrong when reading list of active databases");
+		proc_exit(0);
+
+	}
+	PG_END_TRY();
+
+	CurrentResourceOwner = proResourceOwner;
+
+	if (n_processed_databases < n_active_databases)
+	{
+		prepare_config_reading(NameStr(active_databases[n_processed_databases++]));
+		elog(LOG, "scheduler: configuration reading started");
+	}
 
 	dbworker = jbsch_NewDatabaseWorker("worker one", NULL, NULL,
 						 4000, 10, 1024,
@@ -255,8 +507,8 @@ main_worker_handler(Datum main_arg)
 									    &database_worker_handler,
 									    JBSCH_DBWORKER_SHORT_SQLCMD);
 
-	jbsch_DBWorkersPoolPush(dbworker, simple_dbw_receive_trigger, simple_dbw_event_trigger, &t1);
-	jbsch_DBWorkersPoolPush(dbworker2, simple_dbw_receive_trigger, simple_dbw_event_trigger, &t2);
+	//jbsch_DBWorkersPoolPush(dbworker, simple_dbw_receive_trigger, simple_dbw_event_trigger, &t1);
+	//jbsch_DBWorkersPoolPush(dbworker2, simple_dbw_receive_trigger, simple_dbw_event_trigger, &t2);
 
 	cfgchange_ch->scheduler_pid = MyProcPid;
 
@@ -272,19 +524,77 @@ main_worker_handler(Datum main_arg)
 	{
 		if (got_sighup)
 		{
-			JBSCH_ScheduledJobData	sjd;
+			JBSCH_ScheduledJobData		jobcfg_data;
 
 			got_sighup = false;
 
 			SpinLockAcquire(&cfgchange_ch->mutex);
 			if (cfgchange_ch->hold_data)
 			{
-				memcpy(&sjd, &cfgchange_ch->data, sizeof(JBSCH_ScheduledJobData));
-				cfgchange_ch->hold_data = false;
+				memcpy(&jobcfg_data, &cfgchange_ch->data, sizeof(JBSCH_ScheduledJobData));
 
-				elog(LOG, "scheduler: job_user: %s", sjd.job_user);
+				cfgchange_ch->hold_data = false;
+				SpinLockRelease(&cfgchange_ch->mutex);
+
+				if (cfgchange_ch->granularity == JBSCH_CONFIGURATION_CHANGE_GRANULARITY_JOB)
+				{
+					if (cfgchange_ch->op == JBSCH_CONFIGURATION_CHANGE_OP_INSERT)
+					{
+						int		free_jobcfg_idx = -1;
+						int	i;
+
+						/* search first free */
+						for (i = 0; i < n_job_configurations; i++)
+						{
+							if (jobs_configurations[i].suspended)
+							{
+								free_jobcfg_idx = i;
+								break;
+							}
+						}
+
+						if (free_jobcfg_idx == -1 && n_job_configurations < MAX_JOBS)
+							free_jobcfg_idx = n_job_configurations++;
+
+						if (free_jobcfg_idx != -1)
+						{
+							memcpy(&jobs_configurations[free_jobcfg_idx], &jobcfg_data, sizeof(JBSCH_ScheduledJobData));
+							elog(LOG, "scheduler: store cfg id: %d", jobs_configurations[free_jobcfg_idx].id);
+						}
+						else
+							elog(LOG, "scheduler: cannot to store more job configurations");
+					}
+
+					if (cfgchange_ch->op == JBSCH_CONFIGURATION_CHANGE_OP_DELETE)
+					{
+						int	i;
+						int		jobcfg_id;
+						bool		found = false;
+
+						jobcfg_id = jobcfg_data.id;
+
+						/* search first free */
+						for (i = 0; i < n_job_configurations; i++)
+						{
+							if (jobs_configurations[i].id == jobcfg_id)
+							{
+								jobs_configurations[i].suspended = true;
+								found = true;
+								break;
+							}
+						}
+
+						if (found)
+							elog(LOG, "scheduler: drop configuration: %d", jobcfg_id);
+						else
+							elog(LOG, "scheduler: cannot to drop job configurations: %d", jobcfg_id);
+					}
+
+				}
 			}
-			SpinLockRelease(&cfgchange_ch->mutex);
+			else
+				/* don't forgot unlock spinlock */
+				SpinLockRelease(&cfgchange_ch->mutex);
 		}
 
 		jbsch_DBWorkersPoolCheckAll();

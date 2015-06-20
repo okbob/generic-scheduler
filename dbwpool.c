@@ -98,6 +98,34 @@ jbsch_DBWorkersPoolPush(JBSCH_DatabaseWorker dbworker,
 	dlist_push_head(&dbworkers_pool, &pe->list_node);
 }
 
+void
+jbsch_SendQuitDbworker(JBSCH_DatabaseWorker dbworker)
+{
+	char		*quit_cmd = "\\q";
+
+	JBSCH_DatabaseWorkerMQMode	mq_mode;
+	JBSCH_DatabaseWorkerPoolEntry pe;
+
+	mq_mode = dbworker->params->mq_mode;
+	pe = (JBSCH_DatabaseWorkerPoolEntry) dbworker->pool_entry;
+
+	if (pe->is_living && pe->is_started && !pe->sent_quit && !pe->is_stopped
+		    && ( mq_mode == JBSCH_DBW_MQ_TO_WORKER || mq_mode == JBSCH_DBW_MQ_BOTH_DIRECTION ))
+	{
+		Size length = strlen(quit_cmd);
+		int		res;
+
+		res = shm_mq_send(dbworker->out_mq_handle, length, quit_cmd, true);
+		if (res == SHM_MQ_DETACHED)
+		{
+			elog(LOG, "worker '%s' is detached unexpectedly", dbworker->name);
+			pe->sent_quit = true; pe->is_detached = true;
+		}
+		else if (res == SHM_MQ_SUCCESS)
+			pe->sent_quit = true;
+	}
+}
+
 /*
  * returns true, when all living workers in pools accepted "\q" command,
  * else returns false, when call should be repeated for some workers

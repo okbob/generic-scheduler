@@ -72,6 +72,10 @@ jbsch_FetchShortSQLCmd(JBSCH_DatabaseWorker dbw)
 void
 jbsch_ExecuteSQL(char *sqlstr)
 {
+	ResourceOwner		oldResourceOwner;
+
+	oldResourceOwner = CurrentResourceOwner; 
+
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	SPI_connect();
@@ -95,4 +99,6 @@ jbsch_ExecuteSQL(char *sqlstr)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+
+	CurrentResourceOwner = oldResourceOwner; 
 }

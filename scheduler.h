@@ -36,7 +36,7 @@
  *
  **************************************************************
  */
-#define Natts_ScheduledJob				15
+#define Natts_ScheduledJob				16
 #define Anum_ScheduledJob_id			1
 #define Anum_ScheduledJob_suspended		2
 #define Anum_ScheduledJob_max_workers		3
@@ -49,9 +49,10 @@
 #define Anum_ScheduledJob_job_timeout		10
 #define Anum_ScheduledJob_job_user		11
 #define Anum_ScheduledJob_job_name		12
-#define Anum_ScheduledJon_job_cmd		13
-#define Anum_ScheduledJob_listen_channel	14
-#define Anum_ScheduledJob_job_start_delay	15
+#define Anum_ScheduledJob_job_cmd		13
+#define Anum_ScheduledJob_job_trigger_fun	14
+#define Anum_ScheduledJob_listen_channel	15
+#define Anum_ScheduledJob_job_start_delay	16
 
 /*
  * basic job configuration - doesn't contains SQL statements due
@@ -81,7 +82,7 @@ typedef JBSCH_ScheduledJobData	*JBSCH_ScheduledJob;
 #define JBSCH_CONFIGURATION_CHANGE_GRANULARITY_DATABASE		'd'
 
 #define JBSCH_CONFIGURATION_CHANGE_OP_INSERT			'i'
-#define JBSCH_CONFIGURATION_CHANGE_OP_UPDATE			'u'
+#define JBSCH_CONFIGURATION_CHANGE_OP_DELETE			'd'
 #define JBSCH_CONFIGURATION_CHANGE_OP_ACTIVATE			'a'
 #define JBSCH_CONFIGURATION_CHANGE_OP_NONACTIVATE		'n'
 
@@ -234,7 +235,8 @@ extern bool		JBSCH_check_timeout;
  *
  */
 TimeOffset jbsch_to_timeoffset(Interval *interval);
-void jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTupleHeader rec);
+void jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTuple tuple, TupleDesc tupdesc);
+void jbsch_SetScheduledJobRecord(JBSCH_ScheduledJob job, HeapTupleHeader rec);
 void jbsch_register_seclabel(void);
 
 /*
@@ -271,5 +273,6 @@ void jbsch_DBWorkersPoolPush(JBSCH_DatabaseWorker dbworker,
 				    JBSCH_PoolEntryReceiveTrigger rec_trigger, JBSCH_PoolEntryEventTrigger event_trigger,
 						    void *data);
 
+void jbsch_SendQuitDbworker(JBSCH_DatabaseWorker dbworker);
 bool jbsch_DBworkersPoolSendQuitAll(void);
 void jbsch_DBWorkersPoolCheckAll(void);
