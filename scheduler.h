@@ -70,10 +70,12 @@ typedef struct
 	TimeOffset	job_repeat_after;
 	TimeOffset	job_start_timeout;
 	TimeOffset	job_timeout;
-	char		job_user[NAMEDATALEN];
-	char		job_name[NAMEDATALEN];
-	char		listen_channel[NAMEDATALEN];
+	NameData	job_user;
+	NameData	job_name;
+	NameData	listen_channel;
 	TimeOffset	job_start_delay;
+
+	NameData	dbname;
 } JBSCH_ScheduledJobData;
 
 typedef JBSCH_ScheduledJobData	*JBSCH_ScheduledJob;
@@ -222,6 +224,7 @@ typedef struct
 	JBSCH_PoolEntryReceiveTrigger		rec_trigger;	/* receive data trigger */
 	JBSCH_PoolEntryEventTrigger		event_trigger;	/* event trigger - start, detach, time .. */
 	dlist_node			list_node;
+	char		*initial_command;		/* when worker is active, it can be initialized by command */
 } JBSCH_DatabaseWorkerPoolEntryData;
 
 
@@ -245,7 +248,7 @@ void jbsch_register_seclabel(void);
  */
 void jbsch_SetShortSQLCmd(JBSCH_DatabaseWorker dbw, const char *sqlstr);
 char *jbsch_FetchShortSQLCmd(JBSCH_DatabaseWorker dbw);
-void jbsch_ExecuteSQL(char *sqlstr);
+bool jbsch_ExecuteSQL(char *sqlstr);
 
 /*
  * dbworker.c

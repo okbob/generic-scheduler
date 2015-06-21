@@ -69,10 +69,11 @@ jbsch_FetchShortSQLCmd(JBSCH_DatabaseWorker dbw)
  * In the end the SPI should not be used due limits - it cannot to run
  * DO statement. "ERROR:  DO is not allowed in a non-volatile function"
  */
-void
+bool
 jbsch_ExecuteSQL(char *sqlstr)
 {
 	ResourceOwner		oldResourceOwner;
+	bool		result = true;
 
 	oldResourceOwner = CurrentResourceOwner; 
 
@@ -97,8 +98,12 @@ jbsch_ExecuteSQL(char *sqlstr)
 		AbortCurrentTransaction();
 		pgstat_report_activity(STATE_IDLE, NULL);
 		FlushErrorState();
+
+		result = false;
 	}
 	PG_END_TRY();
 
 	CurrentResourceOwner = oldResourceOwner; 
+
+	return result;
 }

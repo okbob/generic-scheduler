@@ -21,7 +21,7 @@ CREATE TABLE job_schedule(
   job_user name NOT NULL DEFAULT current_user,       /* used role for execution */
   job_name name NOT NULL DEFAULT '',
   job_cmd text NOT NULL DEFAULT '',                  /* executed SQL statement */
-  job_trigger_func text NOT NULL DEFAULT '',              /* (name, job_planned_start), (name, notify, payload) */
+  job_trigger_func text NOT NULL DEFAULT '',         /* (id, name, job_planned_start), (id, name, notify, payload) */
   listen_channel name NOT NULL DEFAULT '',           /* when job is emmited by NOTIFY instead time */
   job_start_delay interval NOT NULL DEFAULT '0sec'   /* delay between receiving NOTIFY event and job start, all notifications are merged */
 );

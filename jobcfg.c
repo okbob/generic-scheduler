@@ -44,6 +44,10 @@ jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTuple tuple, TupleDesc tupdesc
 {
 	Datum		values[Natts_ScheduledJob];
 	bool		nulls[Natts_ScheduledJob];
+	TimestampTz now;
+
+	now = GetCurrentTimestamp();
+
 
 	Assert(tupdesc->natts == Natts_ScheduledJob);
 
@@ -61,9 +65,25 @@ jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTuple tuple, TupleDesc tupdesc
 	job->job_start_timeout = jbsch_to_timeoffset(DatumGetIntervalP(values[Anum_ScheduledJob_job_start_timeout - 1]));
 	job->job_timeout = jbsch_to_timeoffset(DatumGetIntervalP(values[Anum_ScheduledJob_job_timeout - 1]));
 	job->job_start_delay = jbsch_to_timeoffset(DatumGetIntervalP(values[Anum_ScheduledJob_job_start_delay - 1]));
-	memcpy(job->job_user, NameStr(*DatumGetName(values[Anum_ScheduledJob_job_user - 1])), NAMEDATALEN);
-	memcpy(job->job_name, NameStr(*DatumGetName(values[Anum_ScheduledJob_job_name - 1])), NAMEDATALEN);
-	memcpy(job->listen_channel, NameStr(*DatumGetName(values[Anum_ScheduledJob_listen_channel - 1])), NAMEDATALEN);
+	memcpy(&job->job_user, DatumGetName(values[Anum_ScheduledJob_job_user - 1]), NAMEDATALEN);
+	memcpy(&job->job_name, DatumGetName(values[Anum_ScheduledJob_job_name - 1]), NAMEDATALEN);
+	memcpy(&job->listen_channel, DatumGetName(values[Anum_ScheduledJob_listen_channel - 1]), NAMEDATALEN);
+
+	/* recheck time for jobs and protect agains unwanted runs */
+	if (!job->suspended && *NameStr(job->listen_channel) == '\0')
+	{
+		if (job->job_start < now)
+		{
+			/* ToDo: Can be runned tasks in job_start_timeout */
+			if (job->job_repeat_after == 0)
+				job->suspended = true;
+			else
+			{
+				while (job->job_start < now)
+					job->job_start = TimestampTzPlusMilliseconds(job->job_start, job->job_repeat_after * 1000);
+			}
+		}
+	}
 
 	return;
 }

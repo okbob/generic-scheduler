@@ -35,6 +35,11 @@ static int n_processed_databases = 0;
 /* related to shared memory CCC */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
+static bool configuration_is_done = false;
+
+static char current_database[NAMEDATALEN];
+
+
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sighup = false;
@@ -105,6 +110,217 @@ scheduler_shmem_startup(void)
 	LWLockRelease(AddinShmemInitLock);
 }
 
+#define LEAVE_WHEN_ERROR_OR_QUIT(res, name)		\
+if (res == SHM_MQ_DETACHED) \
+{ \
+	elog(LOG, name ": parent died"); \
+	break; \
+} \
+if (res != SHM_MQ_SUCCESS) \
+{ \
+	elog(LOG, name ": cannot to get data"); \
+	break; \
+} \
+if (strcmp(received_data, "\\q") == 0) \
+{ \
+	break; \
+} 
+
+
+/*
+ * Execute command specified by job_cmd field.
+ *
+ */
+static bool
+SQLExecJob(JBSCH_ScheduledJob jobcfg)
+{
+	int ret;
+	StringInfoData		string;
+	bool		result = false;
+	TupleDesc		tupdesc;
+	HeapTuple		tuple;
+	char			*job_cmd;
+	MemoryContext		oldMemoryContext;
+	int fnum_job_cmd;
+
+	oldMemoryContext = CurrentMemoryContext;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	initStringInfo(&string);
+	appendStringInfo(&string, "SELECT * FROM job_schedule WHERE id = %d", jobcfg->id);
+
+	ret = SPI_execute(string.data, true, 0);
+
+	pfree(string.data);
+
+	if (ret != SPI_OK_SELECT)
+	{
+		elog(LOG, "job executor: cannot to run query to read configuration");
+		proc_exit(1);
+	}
+
+	if (SPI_processed != 1)
+	{
+		elog(LOG, "job executor: unexpected result of query to job_schedule (%d rows)", SPI_processed);
+		proc_exit(1);
+	}
+
+	tupdesc = SPI_tuptable->tupdesc;
+	tuple = SPI_tuptable->vals[0];
+
+	fnum_job_cmd = SPI_fnumber(tupdesc, "job_cmd");
+	job_cmd = SPI_getvalue(tuple, tupdesc, fnum_job_cmd);
+	job_cmd = MemoryContextStrdup(oldMemoryContext, job_cmd);
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	if (*job_cmd != '\0')
+	{
+		result = jbsch_ExecuteSQL(job_cmd);
+	}
+	else
+		elog(LOG, "job executor: job_cmd is empty");
+
+	pfree(job_cmd);
+
+	return result;
+}
+
+/*
+ * SQL executor
+ *
+ * Waiting for command \\sqlexec, read params from toc, do lookup to pg_jobschedule,
+ * execute SQL statement and inform by backcall parent process.
+ *
+ */
+static void
+sqlexec_worker_handler(Datum main_arg)
+{
+	dsm_segment		*segment;
+	JBSCH_DatabaseWorker		self;
+	int	res;
+
+	void		*received_data;
+	Size		received_bytes;
+
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "database configuration reader");
+	segment = dsm_attach(DatumGetInt32(main_arg));
+	if (segment == NULL)
+		elog(ERROR, "unable map dynamic memory segment");
+
+	self = jbsch_SetupDatabaseWorker(segment);
+
+	/* Register functions for SIGTERM/SIGHUP management */
+	pqsignal(SIGTERM, scheduler_sigterm);
+	set_latch_on_sigusr1 = true;
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	while (!got_sigterm)
+	{
+		/*
+		 * With nowait=false it can fall only when parent is detached - finished without
+		 * explicit QUIT command
+		 */
+		res = shm_mq_receive(self->in_mq_handle, &received_bytes, &received_data, false);
+		LEAVE_WHEN_ERROR_OR_QUIT(res, "job executor");
+
+		if (strcmp(received_data, "\\execsqljob") == 0)
+		{
+			JBSCH_ScheduledJob shm_jobcfg = (JBSCH_ScheduledJob) shm_toc_lookup(self->toc, 5);
+			char		*msg_success = "\\success";
+			char		*msg_error = "\\error";
+
+			if (SQLExecJob(shm_jobcfg))
+				shm_mq_send(self->out_mq_handle, strlen(msg_success) + 1, msg_success, false);
+			else
+				shm_mq_send(self->out_mq_handle, strlen(msg_error) + 1, msg_error, false);
+		}
+	}
+
+	dsm_detach(segment);
+
+	proc_exit(0);
+}
+
+static void
+sqlexec_worker_receive_trigger(JBSCH_DatabaseWorker dbworker, void *data, Size bytes, void *received_data)
+{
+	char *cmd = (char *) received_data;
+
+	if (strcmp(cmd, "\\error") == 0)
+		elog(LOG, "scheduler: some wrong");
+
+	jbsch_SendQuitDbworker(dbworker);
+
+	/* ToDo: some tasks can wait to other tasks are finished */
+	SetLatch(&MyProc->procLatch);
+}
+
+static void
+sqlexec_worker_event_trigger(JBSCH_DatabaseWorker dbworker, void *data, JBSCH_DatabaseWorkerEvent event)
+{
+	char *msg_execsqljob = "\\execsqljob";
+
+	if (event == JBSCH_DBW_EVENT_TRIGGER_STARTED)
+		shm_mq_send(dbworker->out_mq_handle, strlen(msg_execsqljob) + 1, msg_execsqljob, true);
+}
+
+static void
+sqlexec_prepare_worker(int jobcfg_id)
+{
+	JBSCH_ScheduledJob jobcfg = NULL;
+	int	i;
+
+	for (i = 0; i < n_job_configurations; i++)
+	{
+		if (jobs_configurations[i].id == jobcfg_id)
+		{
+			jobcfg = &jobs_configurations[i];
+			break;
+		}
+	}
+
+	if (jobcfg != NULL)
+	{
+		if (!jobcfg->suspended)
+		{
+			if (!jobcfg->suspended)
+			{
+
+				JBSCH_DatabaseWorker sqlexec;
+				JBSCH_ScheduledJob shm_jobcfg;
+
+				sqlexec = jbsch_NewDatabaseWorker("job executor", NameStr(jobcfg->dbname), NameStr(jobcfg->job_user),
+									 sizeof(JBSCH_ScheduledJob) + 4000, 10, 1024,
+								    JBSCH_DBW_MQ_BOTH_DIRECTION,
+											    BGW_NEVER_RESTART,
+										    &sqlexec_worker_handler,
+										    0);
+
+				/* when process is initialized, prepare space for configuration */
+				shm_jobcfg = (JBSCH_ScheduledJob) shm_toc_allocate(sqlexec->toc, (sizeof(JBSCH_ScheduledJobData)));
+				memcpy(shm_jobcfg, jobcfg, sizeof(JBSCH_ScheduledJobData));
+				shm_toc_insert(sqlexec->toc, 5, (void *) shm_jobcfg);
+
+				jbsch_DBWorkersPoolPush(sqlexec, sqlexec_worker_receive_trigger, sqlexec_worker_event_trigger, NULL);
+			}
+		}
+		else
+			elog(LOG, "scheduler: ignore configuration - suspended");
+	}
+	else
+		elog(LOG, "scheduler: ignore configuration - invalid id");
+}
+
+
 /*
  * After start reads table job_schedule and send content to parent. When it is started, then
  * read table job_schedule and waiting for getcfg command. Later one by one sending configurations
@@ -164,26 +380,7 @@ config_worker_handler(Datum main_arg)
 		 * explicit QUIT command
 		 */
 		res = shm_mq_receive(self->in_mq_handle, &received_bytes, &received_data, false);
-		if (res == SHM_MQ_DETACHED)
-		{
-			elog(LOG, "config reader: parent died");
-			break;
-		}
-
-		/*
-		 * Should not be done
-		 */
-		if (res != SHM_MQ_SUCCESS)
-		{
-			elog(LOG, "config reader: cannot to get data");
-			break;
-		}
-
-		if (strcmp(received_data, "\\q") == 0)
-		{
-			elog(LOG, "config reader: received QUIT command");
-			break;
-		}
+		LEAVE_WHEN_ERROR_OR_QUIT(res, "config reader");
 
 		if (strcmp(received_data, "\\getcfg") == 0)
 		{
@@ -226,7 +423,17 @@ config_worker_receive_trigger(JBSCH_DatabaseWorker dbworker, void *data, Size by
 		{
 			jobcfg = (JBSCH_ScheduledJob) shm_toc_lookup(dbworker->toc, 5);
 
-			memcpy(&jobs_configurations[n_job_configurations++], jobcfg, sizeof(JBSCH_ScheduledJobData));
+
+			if (!jobcfg->suspended)
+			{
+
+				memcpy(&jobs_configurations[n_job_configurations], jobcfg, sizeof(JBSCH_ScheduledJobData));
+
+				StrNCpy(NameStr(jobs_configurations[n_job_configurations++].dbname),
+							    current_database,
+							    NAMEDATALEN);
+			}
+
 			shm_mq_send(dbworker->out_mq_handle, strlen(msg_getcfg) + 1, msg_getcfg, true);
 		}
 		else
@@ -241,7 +448,12 @@ config_worker_receive_trigger(JBSCH_DatabaseWorker dbworker, void *data, Size by
 		if (n_processed_databases < n_active_databases)
 			prepare_config_reading(NameStr(active_databases[n_processed_databases++]));
 		else
+		{
 			elog(LOG, "scheduler: configuration done (%d configurations).", n_job_configurations);
+			configuration_is_done = true;
+			SetLatch(&MyProc->procLatch);
+		}
+
 	}
 }
 
@@ -265,6 +477,8 @@ prepare_config_reading(char *dbname)
 {
 	JBSCH_DatabaseWorker reader;
 
+	strcpy(current_database, dbname);
+
 	reader = jbsch_NewDatabaseWorker("config reader", dbname, NULL,
 						 sizeof(JBSCH_ScheduledJob) + 4000, 10, 1024,
 							JBSCH_DBW_MQ_BOTH_DIRECTION,
@@ -274,6 +488,49 @@ prepare_config_reading(char *dbname)
 
 	jbsch_DBWorkersPoolPush(reader, config_worker_receive_trigger, config_worker_event_trigger, NULL);
 }
+
+
+
+
+/*
+ *
+ * DBWorkerCommandInfo(tag, toc_key, is_protected, mutex, varsize)
+ * 
+ * PREPARE_INFO(sqlexec, FINISH)
+ * struct (command_id, data_id
+ *
+ * Database Worker Context ...
+ *     dsm_segment
+ *     resourceOwner
+ *
+ *  jbsch_InitDBWorkerContext(&context);
+ *
+ *  while (jbsch_DBWorkerWaitForCommand(Context, &cmdinfo))
+ *  {
+ *      switch (jbsch_GetCommandTag(cmdinfo))
+ *      {
+ *            case EXECSQL:
+ *                  // protected ~ protected agains a rewrite of unread data 
+ *                  jobcfg = JBSCH_GETCOMMAND_PROTECTED_SHMDATA(cmdinfo, JBSCH_JobSchedule);
+                             JBSCH_GETCOMMAND_SHMDATA(...)
+ *      }
+ 
+ *      ... if (!jbsch_DBWorkerSendInfo(Context, INFO(sqlexec, DONE))
+ *               jbsch_DBWorkerSendInfo(Context, INFO_WITH_DATA(FINISH, &var, vartype, TOC_KEY_CMDXXX))
+ *              break;
+ *  }
+ *
+ *  jbsch_DestroyDBWorkerContext(&context);
+ *  proc_exit(0);
+ *
+ * Database Worker Controller
+ *
+ *      EventTrigger(ControllerInfo, void *data, EVENT)
+ *          jbsch_SendCommand(COMMAND[_WITH_DATA( ..)]
+            jbsch_
+ *          JBSCH_GETINFO_SHMDATA(info)
+ *   newctr = jbsch_NewDBWorkerController(...,  JBSCH_COMMAND(..))
+ */
 
 static void
 database_worker_handler(Datum main_arg)
@@ -306,26 +563,7 @@ database_worker_handler(Datum main_arg)
 		 * explicit QUIT command
 		 */
 		res = shm_mq_receive(self->in_mq_handle, &received_bytes, &received_data, false);
-		if (res == SHM_MQ_DETACHED)
-		{
-			elog(LOG, "worker: parent died");
-			break;
-		}
-
-		/*
-		 * Should not be done
-		 */
-		if (res != SHM_MQ_SUCCESS)
-		{
-			elog(LOG, "worker: cannot to get data");
-			break;
-		}
-
-		if (strcmp(received_data, "\\q") == 0)
-		{
-			elog(LOG, "worker: received QUIT command");
-			break;
-		}
+		LEAVE_WHEN_ERROR_OR_QUIT(res, "worker");
 
 		if (strcmp(received_data, "\\inc") == 0)
 		{
@@ -414,6 +652,8 @@ main_worker_handler(Datum main_arg)
 	JBSCH_DatabaseWorker		dbworker;
 	JBSCH_DatabaseWorker		dbworker2;
 	ResourceOwner		proResourceOwner;
+	TimestampTz			next_job_start;
+	bool				next_job_start_is_valid = false;
 	int rc;
 
 	int	t1 = 1000;
@@ -597,15 +837,67 @@ main_worker_handler(Datum main_arg)
 				SpinLockRelease(&cfgchange_ch->mutex);
 		}
 
+		if (configuration_is_done)
+		{
+			int		i;
+			TimestampTz	now = GetCurrentTimestamp();
+
+			next_job_start_is_valid = false;
+
+			/* run workers for scheduled statements */
+			for (i = 0; i < n_job_configurations; i++)
+			{
+				JBSCH_ScheduledJob job = &jobs_configurations[i];
+
+				if (!job->suspended)
+				{
+					if (job->job_start < now)
+					{
+						sqlexec_prepare_worker(job->id);
+
+						if (job->job_repeat_after == 0)
+							job->suspended = true;
+						else
+						{
+							/* ToDo: this can be done after last process of job was processed */
+
+							while (job->job_start < now)
+								job->job_start = TimestampTzPlusMilliseconds(job->job_start, job->job_repeat_after * 1000);
+						}
+					}
+
+					if (!job->suspended)
+					{
+						if (!next_job_start_is_valid)
+						{
+							next_job_start = job->job_start;
+							next_job_start_is_valid = true;
+						}
+						else if (next_job_start > job->job_start)
+							next_job_start = job->job_start;
+					}
+				}
+			}
+		}
+
 		jbsch_DBWorkersPoolCheckAll();
 
-		if (JBSCH_check_timeout)
+		if (JBSCH_check_timeout || next_job_start_is_valid)
 		{
 			long	sec;
 			int	microsec;
 			TimestampTz now = GetCurrentTimestamp();
+			TimestampTz nt;
 
-			TimestampDifference(now, JBSCH_timeout_fin_time, &sec, &microsec);
+			if (!JBSCH_check_timeout)
+				nt = next_job_start;
+			else if (!next_job_start_is_valid)
+				nt = JBSCH_timeout_fin_time;
+			else
+				nt = JBSCH_timeout_fin_time < next_job_start ? JBSCH_timeout_fin_time : next_job_start;
+
+
+			TimestampDifference(now, nt, &sec, &microsec);
 
 			rc = WaitLatch(MyLatch,
 					 WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_TIMEOUT, (1000L * sec) + (microsec / 1000L));
