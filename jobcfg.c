@@ -10,6 +10,8 @@
  */
 #include "scheduler.h"
 
+#include "utils/builtins.h"
+
 /*
  * shared variable used for communication - scheduler <= any client process.
  */
@@ -68,6 +70,8 @@ jbsch_SetScheduledJob(JBSCH_ScheduledJob job, HeapTuple tuple, TupleDesc tupdesc
 	memcpy(&job->job_user, DatumGetName(values[Anum_ScheduledJob_job_user - 1]), NAMEDATALEN);
 	memcpy(&job->job_name, DatumGetName(values[Anum_ScheduledJob_job_name - 1]), NAMEDATALEN);
 	memcpy(&job->listen_channel, DatumGetName(values[Anum_ScheduledJob_listen_channel - 1]), NAMEDATALEN);
+
+	namestrcpy(&job->dbname, get_database_name(MyDatabaseId));
 
 	/* recheck time for jobs and protect agains unwanted runs */
 	if (!job->suspended && *NameStr(job->listen_channel) == '\0')

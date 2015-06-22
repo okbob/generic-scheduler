@@ -10,10 +10,12 @@
  */
 #include "scheduler.h"
 
+#include "utils/timestamp.h"
+
 /*
  * Todo:
  *      --- 1. fix SQL execution
- *      -- 2. security label and configuration load
+ *      --- 2. security label and configuration load
  *      3. Throtling and worker state machine
  *      4. Notify event listeners
  *      6. split to files and cleaning
@@ -142,6 +144,10 @@ SQLExecJob(JBSCH_ScheduledJob jobcfg)
 	char			*job_cmd;
 	MemoryContext		oldMemoryContext;
 	int fnum_job_cmd;
+	int fnum_job_timeout;
+	Interval		*job_timeout;
+	int			job_timeout_ms;
+	bool			isnull;
 
 	oldMemoryContext = CurrentMemoryContext;
 
@@ -176,14 +182,17 @@ SQLExecJob(JBSCH_ScheduledJob jobcfg)
 	job_cmd = SPI_getvalue(tuple, tupdesc, fnum_job_cmd);
 	job_cmd = MemoryContextStrdup(oldMemoryContext, job_cmd);
 
+	fnum_job_timeout = SPI_fnumber(tupdesc, "job_timeout");
+
+	job_timeout = DatumGetIntervalP(SPI_getbinval(tuple, tupdesc, fnum_job_timeout, &isnull));
+	job_timeout_ms = jbsch_to_timeoffset(job_timeout) * 1000;
+
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	if (*job_cmd != '\0')
-	{
-		result = jbsch_ExecuteSQL(job_cmd);
-	}
+		result = jbsch_ExecuteSQL(job_cmd, job_timeout_ms);
 	else
 		elog(LOG, "job executor: job_cmd is empty");
 
@@ -530,6 +539,8 @@ prepare_config_reading(char *dbname)
             jbsch_
  *          JBSCH_GETINFO_SHMDATA(info)
  *   newctr = jbsch_NewDBWorkerController(...,  JBSCH_COMMAND(..))
+ *
+ * DeterminateSleepTime(...)
  */
 
 static void
@@ -578,7 +589,7 @@ database_worker_handler(Datum main_arg)
 		{
 			char *sqlstr = jbsch_FetchShortSQLCmd(self);
 
-			jbsch_ExecuteSQL(sqlstr);
+			jbsch_ExecuteSQL(sqlstr, -1);
 			pfree(sqlstr);
 		}
 	}

@@ -248,7 +248,7 @@ void jbsch_register_seclabel(void);
  */
 void jbsch_SetShortSQLCmd(JBSCH_DatabaseWorker dbw, const char *sqlstr);
 char *jbsch_FetchShortSQLCmd(JBSCH_DatabaseWorker dbw);
-bool jbsch_ExecuteSQL(char *sqlstr);
+bool jbsch_ExecuteSQL(char *sqlstr, int statement_timeout_ms);
 
 /*
  * dbworker.c

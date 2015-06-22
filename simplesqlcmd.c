@@ -9,6 +9,8 @@
  *-------------------------------------------------------------------------
  */
 #include "scheduler.h"
+#include "utils/guc.h"
+#include "utils/timeout.h"
 
 /*
  * Copy text of SQL statement to shared memory related buffer.
@@ -70,7 +72,7 @@ jbsch_FetchShortSQLCmd(JBSCH_DatabaseWorker dbw)
  * DO statement. "ERROR:  DO is not allowed in a non-volatile function"
  */
 bool
-jbsch_ExecuteSQL(char *sqlstr)
+jbsch_ExecuteSQL(char *sqlstr, int statement_timeout_ms)
 {
 	ResourceOwner		oldResourceOwner;
 	bool		result = true;
@@ -85,6 +87,20 @@ jbsch_ExecuteSQL(char *sqlstr)
 
 	PG_TRY();
 	{
+		if (statement_timeout_ms >= 0)
+		{
+			char		buffer[20];
+
+			snprintf(buffer, 20, "%d", statement_timeout_ms);
+		
+			set_config_option("statement_timeout", buffer, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_LOCAL, true, 0, false);
+
+			if (StatementTimeout > 0)
+				enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
+			else
+				disable_timeout(STATEMENT_TIMEOUT, false);
+		}
+
 		SPI_execute(sqlstr, false, 1);
 
 		SPI_finish();
